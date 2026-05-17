@@ -29,6 +29,7 @@ class StateHistoryCard extends HTMLElement {
     this._historyFetchSignature = "";
     this._loadedEndMs = undefined;
     this._labelFrame = undefined;
+    this._labelSettleTimer = undefined;
     this._axisWidth = 0;
     this._rangeStartMs = undefined;
     this._rangeEndMs = undefined;
@@ -40,6 +41,17 @@ class StateHistoryCard extends HTMLElement {
     this._labelPressTimer = undefined;
     this._labelLongPressed = false;
     this._labelPressTarget = undefined;
+    // --- Energy date picker state ---
+    this._energyCollectionUnsub = undefined;
+    this._energyCollection = undefined;
+    this._energyStart = undefined;
+    this._energyEnd = undefined;
+    this._energyCompareStart = undefined;
+    this._energyCompareEnd = undefined;
+    this._energyRetryTimer = undefined;
+    this._energyRetryCount = 0;
+    this._compareHistory = new Map();
+    // --- End energy date picker state ---
     this._handleDocumentPointerDown = (event) => {
       if (!event.composedPath().includes(this)) this._hideTooltip();
     };
@@ -64,6 +76,8 @@ class StateHistoryCard extends HTMLElement {
     window.removeEventListener("scroll", this._handleWindowScroll, true);
     this._clearLabelPress();
     if (this._labelFrame) cancelAnimationFrame(this._labelFrame);
+    if (this._labelSettleTimer) clearTimeout(this._labelSettleTimer);
+    this._unsubscribeEnergyCollection();
   }
 
   setConfig(config) {
@@ -94,6 +108,10 @@ class StateHistoryCard extends HTMLElement {
       this._rangeEndMs = undefined;
     }
     this._lastStateSignature = "";
+    // If switching to/from energy picker mode, reset subscription
+    if (this._config.use_energy_date_picker) {
+      this._unsubscribeEnergyCollection();
+    }
     this._render();
   }
 
@@ -109,6 +127,84 @@ class StateHistoryCard extends HTMLElement {
       }
       return;
     }
+
+    // --- Energy date picker mode ---
+    if (this._config.use_energy_date_picker) {
+      if (!this._energyCollectionUnsub) {
+        this._subscribeEnergyCollection();
+      }
+
+      // --- Defensive compare sync ---
+      // The collection's .compare property is synchronously updated by the
+      // energy-date-selection card's toggle, while the async subscriber
+      // callback may lag behind or not fire in some HA versions.
+      // Poll collection.compare directly to detect toggle changes.
+      if (this._energyCollection && this._config.allow_compare !== false) {
+        const isCompareActive = !!this._energyCollection.compare;
+        if (!isCompareActive && (this._energyCompareStart || this._energyCompareEnd)) {
+          // Compare was just toggled OFF — clear immediately
+          this._energyCompareStart = undefined;
+          this._energyCompareEnd = undefined;
+          this._compareHistory = new Map();
+          this._lastFetchKey = "";
+          this._historyFetchSignature = "";
+          this._loadedEndMs = undefined;
+          this._fetchHistory();
+          return;
+        }
+        if (isCompareActive && !this._energyCompareStart) {
+          // Compare was just toggled ON but subscriber hasn't fired yet.
+          // Read from collection.state if available.
+          const colState = this._energyCollection.state;
+          if (colState && colState.startCompare) {
+            this._energyCompareStart = colState.startCompare;
+            this._energyCompareEnd = colState.endCompare || undefined;
+            this._lastFetchKey = "";
+            this._historyFetchSignature = "";
+            this._loadedEndMs = undefined;
+            this._fetchHistory();
+            return;
+          }
+        }
+      } else if (this._energyCollection) {
+        // allow_compare is false — always clear
+        if (this._energyCompareStart || this._energyCompareEnd) {
+          this._energyCompareStart = undefined;
+          this._energyCompareEnd = undefined;
+          this._compareHistory = new Map();
+          this._lastFetchKey = "";
+          this._render();
+        }
+      }
+      // --- End defensive compare sync ---
+
+      // In energy picker mode, only re-fetch on refresh_interval for live updates
+      if (this._energyStart) {
+        const now = Date.now();
+        const fetchKey = [
+          this._entityIds().join(","),
+          this._energyStart.getTime(),
+          this._energyEnd?.getTime() || "",
+          this._energyCompareStart?.getTime() || "",
+          this._energyCompareEnd?.getTime() || "",
+          Math.floor(now / (this._config.refresh_interval * 1000)),
+        ].join("|");
+        if (fetchKey !== this._lastFetchKey && !this._loading) {
+          this._lastFetchKey = fetchKey;
+          this._fetchHistory();
+          return;
+        }
+      }
+      const stateSignature = this._stateSignature();
+      if (stateSignature !== this._lastStateSignature) {
+        this._lastStateSignature = stateSignature;
+        this._render();
+      } else {
+        this._syncLabelActionColors();
+      }
+      return;
+    }
+    // --- End energy date picker mode ---
 
     const now = Date.now();
     const fetchKey = [
@@ -155,6 +251,8 @@ class StateHistoryCard extends HTMLElement {
     return JSON.stringify({
       entities,
       hours_to_show: config.hours_to_show ?? 24,
+      use_energy_date_picker: config.use_energy_date_picker ?? false,
+      collection_key: config.collection_key ?? "",
       recorder: config.recorder === true,
       bucket_minutes: config.bucket_minutes ?? 0,
       entity_buckets: (config.entities || []).map((entry) =>
@@ -205,11 +303,21 @@ class StateHistoryCard extends HTMLElement {
     const entityIds = this._entityIds();
     if (entityIds.length === 0) return;
 
-    const end = new Date();
-    end.setSeconds(0, 0);
-    const endMs = end.getTime();
-    const startMs = endMs - this._config.hours_to_show * 60 * 60 * 1000;
-    const signature = [entityIds.join(","), this._config.hours_to_show].join("|");
+    let endMs, startMs;
+
+    // --- Energy date picker mode: use picker dates ---
+    if (this._config.use_energy_date_picker && this._energyStart) {
+      startMs = this._energyStart.getTime();
+      endMs = this._energyEnd ? this._energyEnd.getTime() : Date.now();
+    } else {
+      const end = new Date();
+      end.setSeconds(0, 0);
+      endMs = end.getTime();
+      startMs = endMs - this._config.hours_to_show * 60 * 60 * 1000;
+    }
+    // --- End energy date picker mode ---
+
+    const signature = [entityIds.join(","), startMs, endMs].join("|");
     const fullFetch =
       signature !== this._historyFetchSignature ||
       !Number.isFinite(this._loadedEndMs) ||
@@ -226,7 +334,7 @@ class StateHistoryCard extends HTMLElement {
 
     const params = new URLSearchParams({
       filter_entity_id: entityIds.join(","),
-      end_time: end.toISOString(),
+      end_time: new Date(endMs).toISOString(),
     });
     params.set("minimal_response", "");
     params.set("no_attributes", "");
@@ -295,6 +403,44 @@ class StateHistoryCard extends HTMLElement {
       this._historyFetchSignature = signature;
       this._loadedEndMs = endMs;
       this._lastStateSignature = this._stateSignature();
+
+      // --- Compare mode: fetch compare period history ---
+      if (this._config.use_energy_date_picker && this._config.allow_compare !== false
+          && this._energyCompareStart && this._energyCompareEnd) {
+        const cStartMs = this._energyCompareStart.getTime();
+        const cEndMs = this._energyCompareEnd.getTime();
+        const cFetchStart = new Date(cStartMs);
+        const cParams = new URLSearchParams({
+          filter_entity_id: entityIds.join(","),
+          end_time: new Date(cEndMs).toISOString(),
+        });
+        cParams.set("minimal_response", "");
+        cParams.set("no_attributes", "");
+        try {
+          const compareHistory = new Map();
+          const cResponse = await this._hass.callApi(
+            "GET",
+            `history/period/${encodeURIComponent(cFetchStart.toISOString())}?${cParams.toString()}`
+          );
+          for (const series of cResponse || []) {
+            if (!series.length) continue;
+            const entityId = this._seriesEntityId(series, entityIds);
+            if (!entityId) continue;
+            compareHistory.set(entityId, this._prunedHistorySeries(series, cStartMs));
+          }
+          for (const entityId of entityIds) {
+            if (!compareHistory.has(entityId) && this._hass.states[entityId]) {
+              compareHistory.set(entityId, []);
+            }
+          }
+          this._compareHistory = compareHistory;
+        } catch (cErr) {
+          this._compareHistory = new Map();
+        }
+      } else {
+        this._compareHistory = new Map();
+      }
+      // --- End compare mode ---
     } catch (err) {
       this._error = err?.message || String(err);
     } finally {
@@ -378,6 +524,111 @@ class StateHistoryCard extends HTMLElement {
     const numeric = Number(value);
     return Number.isFinite(numeric) ? numeric : Date.parse(value);
   }
+
+  // ===========================================================================
+  // Energy Date Picker Integration
+  // ===========================================================================
+
+  _energyCollectionKey() {
+    if (this._config.collection_key) {
+      return `_${this._config.collection_key}`;
+    }
+    // HA 2026.4+ uses panel-scoped keys; older versions use "_energy"
+    const version = this._hass?.config?.version || "";
+    const [major, minor] = version.split(".").map(Number);
+    if (major > 2026 || (major === 2026 && minor >= 4)) {
+      const panelUrl = this._hass?.panelUrl || "lovelace";
+      return `_energy_${panelUrl}`;
+    }
+    return "_energy";
+  }
+
+  _subscribeEnergyCollection() {
+    if (this._energyCollectionUnsub) return;
+    if (!this._hass?.connection) {
+      this._scheduleEnergyRetry();
+      return;
+    }
+
+    const key = this._energyCollectionKey();
+    const connection = this._hass.connection;
+    const candidate = typeof connection === "object" && connection !== null
+      ? connection[key]
+      : undefined;
+
+    if (!candidate || typeof candidate.subscribe !== "function") {
+      this._scheduleEnergyRetry();
+      return;
+    }
+
+    this._energyCollection = candidate;
+    this._energyRetryCount = 0;
+    if (this._energyRetryTimer) {
+      clearTimeout(this._energyRetryTimer);
+      this._energyRetryTimer = undefined;
+    }
+
+    this._energyCollectionUnsub = candidate.subscribe((data) => {
+      const prevStart = this._energyStart?.getTime();
+      const prevEnd = this._energyEnd?.getTime();
+      const prevCompareStart = this._energyCompareStart?.getTime();
+      const prevCompareEnd = this._energyCompareEnd?.getTime();
+
+      this._energyStart = data.start || undefined;
+      this._energyEnd = data.end || undefined;
+
+      // Compare mode support
+      if (this._config.allow_compare !== false) {
+        this._energyCompareStart = data.startCompare || undefined;
+        this._energyCompareEnd = data.endCompare || undefined;
+      } else {
+        this._energyCompareStart = undefined;
+        this._energyCompareEnd = undefined;
+      }
+
+      const newStart = this._energyStart?.getTime();
+      const newEnd = this._energyEnd?.getTime();
+      const newCompareStart = this._energyCompareStart?.getTime();
+      const newCompareEnd = this._energyCompareEnd?.getTime();
+
+      // Re-fetch if main dates OR compare dates changed
+      const mainChanged = newStart !== prevStart || newEnd !== prevEnd;
+      const compareChanged = newCompareStart !== prevCompareStart || newCompareEnd !== prevCompareEnd;
+      if (mainChanged || compareChanged) {
+        this._lastFetchKey = "";
+        this._historyFetchSignature = "";
+        this._loadedEndMs = undefined;
+        this._fetchHistory();
+      }
+    });
+  }
+
+  _unsubscribeEnergyCollection() {
+    if (this._energyRetryTimer) {
+      clearTimeout(this._energyRetryTimer);
+      this._energyRetryTimer = undefined;
+    }
+    if (this._energyCollectionUnsub) {
+      this._energyCollectionUnsub();
+      this._energyCollectionUnsub = undefined;
+    }
+    this._energyCollection = undefined;
+    this._energyRetryCount = 0;
+  }
+
+  _scheduleEnergyRetry() {
+    if (this._energyRetryCount >= 50) return; // Give up after ~10s
+    this._energyRetryCount += 1;
+    if (this._energyRetryTimer) clearTimeout(this._energyRetryTimer);
+    this._energyRetryTimer = setTimeout(() => {
+      this._energyRetryTimer = undefined;
+      this._subscribeEnergyCollection();
+    }, 200);
+  }
+
+  // ===========================================================================
+  // End Energy Date Picker Integration
+  // ===========================================================================
 
   _seriesEntityId(series, entityIds) {
     const explicit = series.find((item) => item?.entity_id)?.entity_id;
@@ -837,8 +1088,8 @@ class StateHistoryCard extends HTMLElement {
     return `hsl(${hash} 64% 48%)`;
   }
 
-  _intervalsFor(entry, startMs, endMs) {
-    const raw = this._history.get(entry.entity) || [];
+  _intervalsFor(entry, startMs, endMs, historySource) {
+    const raw = (historySource || this._history).get(entry.entity) || [];
     const points = raw
       .map((item) => ({
         state: item.state,
@@ -886,11 +1137,16 @@ class StateHistoryCard extends HTMLElement {
     const currentAttributes =
       current && current.state === active.state ? current.attributes || active.attributes || {} : active.attributes || {};
 
+    /* Clamp the last interval to "now" when the range extends into the future,
+       so the track background shows through for the not-yet-happened portion. */
+    const nowMs = Date.now();
+    const effectiveEnd = endMs > nowMs ? Math.min(endMs, nowMs) : endMs;
+
     intervals.push({
       state: active.state,
       attributes: currentAttributes,
       start: Math.max(startMs, active.changed),
-      end: endMs,
+      end: effectiveEnd,
     });
 
     const visibleIntervals = intervals.filter((item) => item.end > item.start);
@@ -1028,11 +1284,22 @@ class StateHistoryCard extends HTMLElement {
     const endMs = this._rangeEndMs || fallbackEndMs;
     const startMs = this._rangeStartMs || endMs - this._config.hours_to_show * 60 * 60 * 1000;
     const spanMs = endMs - startMs;
+
+    // --- Compare mode: compute compare intervals ---
+    const hasCompare = this._config.use_energy_date_picker
+      && this._config.allow_compare !== false
+      && this._energyCompareStart && this._energyCompareEnd;
+    const compareStartMs = hasCompare ? this._energyCompareStart.getTime() : undefined;
+    const compareEndMs = hasCompare ? this._energyCompareEnd.getTime() : undefined;
+    const compareSpanMs = hasCompare ? compareEndMs - compareStartMs : 0;
+    // --- End compare mode ---
+
     const rows = this._entityConfigs()
       .filter((entry) => entry.entity)
       .map((entry) => ({
         entry,
         intervals: this._intervalsFor(entry, startMs, endMs),
+        compareIntervals: hasCompare ? this._intervalsFor(entry, compareStartMs, compareEndMs, this._compareHistory) : [],
       }));
     this._renderedRows = new Map(rows.map((row) => [row.entry.entity, row]));
     const states = this._legendStates(rows);
@@ -1043,28 +1310,85 @@ class StateHistoryCard extends HTMLElement {
     const axisTicks = labelMode === "on" ? this._axisTicks(startMs, endMs) : [];
     const showStateLabels = this._stateLabelsVisible();
     const layout = this._layoutMetrics();
+    const segmentLabelMetrics = this._segmentLabelMetrics();
 
-    this.shadowRoot.innerHTML = `
-      <style>
+    /* Future overlay: percentage of the track that is in the future */
+    const nowMs = Date.now();
+    const nowPercent = endMs > nowMs ? Math.min(100, Math.max(0, ((nowMs - startMs) / spanMs) * 100)) : null;
+
+    /* ---- Ensure the static <style> exists (created once, never replaced) ---- */
+    if (!this._shcStyleEl) {
+      this._shcStyleEl = document.createElement("style");
+      this._shcStyleEl.setAttribute("data-shc", "");
+      this._shcStyleEl.textContent = `
         :host {
           display: block;
         }
 
         ha-card {
+          /* --- Customizable CSS variables (card_mod targets) --- */
+          /* Card shell */
+          --shc-card-padding: var(--state-history-card-padding, 16px);
+          --shc-card-background: var(--state-history-card-background, var(--ha-card-background, var(--card-background-color)));
+          --shc-card-border-radius: var(--state-history-card-border-radius, var(--ha-card-border-radius, 12px));
+          /* Title */
+          --shc-title-font-size: var(--state-history-title-font-size, var(--ha-card-header-font-size, 24px));
+          --shc-title-font-weight: var(--state-history-title-font-weight, normal);
+          --shc-title-color: var(--state-history-title-color, var(--ha-card-header-color, var(--primary-text-color)));
+          --shc-title-padding: var(--state-history-title-padding, 16px 16px 0);
+          /* Entity label column */
+          --shc-label-font-size: var(--state-history-label-font-size, 13px);
+          --shc-label-font-weight: var(--state-history-label-font-weight, normal);
+          --shc-label-color: var(--state-history-label-color, var(--primary-text-color));
+          --shc-label-line-height: var(--state-history-label-line-height, 18px);
+          /* Timeline tracks */
+          --shc-row-height: var(--state-history-row-height, 18px);
+          --shc-row-gap: var(--state-history-row-gap, 10px);
+          --shc-track-border-radius: var(--state-history-track-border-radius, 4px);
+          --shc-track-background: var(--state-history-track-background, var(--secondary-background-color));
+          --shc-track-grid-color: var(--state-history-track-grid-color, var(--divider-color));
+          /* Future overlay (area after "now" in today's view) */
+          --shc-future-color: var(--state-history-future-color, rgba(0, 0, 0, 0.15));
+          /* Segment labels (inside timeline bars) */
+          --shc-segment-font-size: var(--state-history-segment-font-size, 11px);
+          --shc-segment-font-weight: var(--state-history-segment-font-weight, 500);
+          /* Compare rows */
+          --shc-compare-row-height: var(--state-history-compare-row-height, calc(var(--shc-row-height) * 0.6));
+          --shc-compare-row-opacity: var(--state-history-compare-row-opacity, 0.5);
+          --shc-compare-row-margin-top: var(--state-history-compare-row-margin-top, -6px);
+          --shc-compare-label-font-size: var(--state-history-compare-label-font-size, 10px);
+          /* Axis (time labels) */
+          --shc-axis-font-size: var(--state-history-axis-font-size, 11px);
+          --shc-axis-color: var(--state-history-axis-color, var(--secondary-text-color));
+          --shc-axis-tick-color: var(--state-history-axis-tick-color, var(--divider-color));
+          /* Legend */
+          --shc-legend-font-size: var(--state-history-legend-font-size, 12px);
+          --shc-legend-color: var(--state-history-legend-color, var(--secondary-text-color));
+          --shc-legend-gap: var(--state-history-legend-gap, 8px 14px);
+          --shc-legend-margin-top: var(--state-history-legend-margin-top, 14px);
+          --shc-swatch-size: var(--state-history-swatch-size, 10px);
+          /* Tooltip */
+          --shc-tooltip-font-size: var(--state-history-tooltip-font-size, 12px);
+          --shc-tooltip-border-radius: var(--state-history-tooltip-border-radius, 6px);
+          --shc-tooltip-padding: var(--state-history-tooltip-padding, 8px 10px);
+
           overflow: visible;
           position: relative;
+          background: var(--shc-card-background);
+          border-radius: var(--shc-card-border-radius);
         }
 
         .content {
-          padding: 16px;
+          padding: var(--shc-card-padding);
         }
 
         .header {
-          color: var(--ha-card-header-color, var(--primary-text-color));
+          color: var(--shc-title-color);
           font-family: var(--ha-card-header-font-family, inherit);
-          font-size: var(--title-size, var(--ha-card-header-font-size, 24px));
+          font-size: var(--title-size, var(--shc-title-font-size));
+          font-weight: var(--shc-title-font-weight);
           line-height: 1.2;
-          padding: 16px 16px 0;
+          padding: var(--shc-title-padding);
           text-align: left;
         }
 
@@ -1106,7 +1430,7 @@ class StateHistoryCard extends HTMLElement {
 
         .chart {
           display: grid;
-          gap: 10px;
+          gap: var(--shc-row-gap);
           position: relative;
           z-index: 1;
         }
@@ -1120,10 +1444,11 @@ class StateHistoryCard extends HTMLElement {
 
         .name {
           appearance: none;
-          color: var(--primary-text-color);
+          color: var(--shc-label-color);
           font: inherit;
-          font-size: 13px;
-          line-height: 18px;
+          font-size: var(--shc-label-font-size);
+          font-weight: var(--shc-label-font-weight);
+          line-height: var(--shc-label-line-height);
           overflow: hidden;
           border: 0;
           padding: 0;
@@ -1156,18 +1481,45 @@ class StateHistoryCard extends HTMLElement {
 
         .track {
           position: relative;
-          height: var(--state-history-row-height, 18px);
+          height: var(--shc-row-height);
           overflow: hidden;
-          border-radius: 4px;
+          border-radius: var(--shc-track-border-radius);
           background:
             repeating-linear-gradient(
               90deg,
               transparent 0,
               transparent calc(25% - 1px),
-              var(--divider-color) calc(25% - 1px),
-              var(--divider-color) 25%
+              var(--shc-track-grid-color) calc(25% - 1px),
+              var(--shc-track-grid-color) 25%
             ),
-            var(--track-background, var(--secondary-background-color));
+            var(--track-background, var(--shc-track-background));
+        }
+
+        .future-overlay {
+          position: absolute;
+          top: 0;
+          bottom: 0;
+          right: 0;
+          background: var(--shc-future-color);
+          z-index: 1;
+          pointer-events: none;
+        }
+
+        .compare-row {
+          margin-top: var(--shc-compare-row-margin-top);
+          opacity: var(--shc-compare-row-opacity);
+        }
+
+        .compare-row .track {
+          height: var(--shc-compare-row-height);
+          border-radius: 0 0 var(--shc-track-border-radius) var(--shc-track-border-radius);
+        }
+
+        .compare-label {
+          font-size: var(--shc-compare-label-font-size);
+          color: var(--shc-axis-color);
+          text-align: right;
+          padding-right: 4px;
         }
 
         .segment {
@@ -1195,9 +1547,9 @@ class StateHistoryCard extends HTMLElement {
           overflow: hidden;
           padding: 0 5px;
           color: var(--segment-text-color, var(--text-primary-color, #fff));
-          font-size: 11px;
-          font-weight: 500;
-          line-height: var(--state-history-row-height, 18px);
+          font-size: var(--shc-segment-font-size);
+          font-weight: var(--shc-segment-font-weight);
+          line-height: var(--shc-row-height);
           text-overflow: ellipsis;
           text-shadow: var(--segment-text-shadow, 0 1px 1px rgb(0 0 0 / 45%));
           white-space: nowrap;
@@ -1218,9 +1570,9 @@ class StateHistoryCard extends HTMLElement {
           overflow: hidden;
           padding: 0 2px;
           color: var(--segment-text-color, var(--text-primary-color, #fff));
-          font-size: 11px;
-          font-weight: 500;
-          line-height: var(--state-history-row-height, 18px);
+          font-size: var(--shc-segment-font-size);
+          font-weight: var(--shc-segment-font-weight);
+          line-height: var(--shc-row-height);
           text-align: center;
           text-overflow: clip;
           text-shadow: var(--segment-text-shadow, 0 1px 1px rgb(0 0 0 / 45%));
@@ -1233,13 +1585,13 @@ class StateHistoryCard extends HTMLElement {
           z-index: 1000;
           display: none;
           max-width: min(320px, calc(100vw - 24px));
-          padding: 8px 10px;
+          padding: var(--shc-tooltip-padding);
           border: 1px solid var(--divider-color);
-          border-radius: 6px;
+          border-radius: var(--shc-tooltip-border-radius);
           background: var(--mdc-theme-surface, var(--ha-card-background, var(--card-background-color)));
           color: var(--primary-text-color);
           box-shadow: var(--ha-card-box-shadow, 0 6px 18px rgb(0 0 0 / 24%));
-          font-size: 12px;
+          font-size: var(--shc-tooltip-font-size);
           line-height: 1.35;
           pointer-events: none;
           white-space: nowrap;
@@ -1266,8 +1618,8 @@ class StateHistoryCard extends HTMLElement {
           gap: var(--entity-label-gap);
           align-items: start;
           margin-top: 2px;
-          color: var(--secondary-text-color);
-          font-size: 11px;
+          color: var(--shc-axis-color);
+          font-size: var(--shc-axis-font-size);
         }
 
         .axis-track {
@@ -1282,7 +1634,7 @@ class StateHistoryCard extends HTMLElement {
           left: var(--tick-center);
           width: 1px;
           height: var(--tick-height, 0px);
-          background: var(--divider-color);
+          background: var(--shc-axis-tick-color);
           opacity: 0.45;
           transform: translateX(-0.5px);
           pointer-events: none;
@@ -1302,11 +1654,11 @@ class StateHistoryCard extends HTMLElement {
         .legend {
           display: flex;
           flex-wrap: wrap;
-          gap: 8px 14px;
+          gap: var(--shc-legend-gap);
           justify-content: flex-start;
-          margin-top: 14px;
-          color: var(--secondary-text-color);
-          font-size: 12px;
+          margin-top: var(--shc-legend-margin-top);
+          color: var(--shc-legend-color);
+          font-size: var(--shc-legend-font-size);
         }
 
         .legend[data-position="center"] {
@@ -1325,8 +1677,8 @@ class StateHistoryCard extends HTMLElement {
         }
 
         .swatch {
-          width: 10px;
-          height: 10px;
+          width: var(--shc-swatch-size);
+          height: var(--shc-swatch-size);
           border-radius: 2px;
           background: var(--swatch-color);
           box-shadow: inset 0 0 0 1px rgb(0 0 0 / 18%);
@@ -1346,7 +1698,19 @@ class StateHistoryCard extends HTMLElement {
             font-size: 12px;
           }
         }
-      </style>
+      `;
+      this.shadowRoot.prepend(this._shcStyleEl);
+    }
+
+    /* ---- Update only the dynamic ha-card content ---- */
+    let container = this.shadowRoot.getElementById("shc-content");
+    if (!container) {
+      container = document.createElement("div");
+      container.id = "shc-content";
+      container.style.display = "contents";
+      this.shadowRoot.appendChild(container);
+    }
+    container.innerHTML = `
       <ha-card style="--entity-label-width:${layout.labelWidth}px;--entity-label-gap:${layout.gap}px">
         ${
           this._config.title
@@ -1360,7 +1724,9 @@ class StateHistoryCard extends HTMLElement {
             ? `<div class="status ${this._error ? "error" : ""}">${
                 this._error ? this._escape(this._error) : "Loading history..."
               }</div>`
-            : ""
+            : this._config.use_energy_date_picker && !this._energyStart
+              ? `<div class="status">Waiting for energy date picker...</div>`
+              : ""
         }
         <div class="content">
           ${
@@ -1369,9 +1735,15 @@ class StateHistoryCard extends HTMLElement {
               : `<div class="chart">
                   ${rows
                     .map(
-                      ({ entry, intervals }) => {
+                      ({ entry, intervals, compareIntervals }) => {
                         const labelAction = this._labelAction(entry);
                         const labelActionColor = this._labelActionColor(entry, intervals);
+                        const compareRow = hasCompare && compareIntervals.length > 0
+                          ? `<div class="row compare-row">
+                              <span class="name compare-label">vs</span>
+                              ${this._trackHtml(entry, compareIntervals, compareStartMs, compareSpanMs, false, null, layout.axisWidth, segmentLabelMetrics)}
+                            </div>`
+                          : "";
                         return `
                         <div class="row">
                           <button
@@ -1386,8 +1758,9 @@ class StateHistoryCard extends HTMLElement {
                           >
                             ${this._escape(this._displayName(entry))}
                           </button>
-                          ${this._trackHtml(entry, intervals, startMs, spanMs, showStateLabels)}
+                          ${this._trackHtml(entry, intervals, startMs, spanMs, showStateLabels, nowPercent, layout.axisWidth, segmentLabelMetrics)}
                         </div>
+                        ${compareRow}
                       `;
                       }
                     )
@@ -1443,13 +1816,16 @@ class StateHistoryCard extends HTMLElement {
     });
   }
 
-  _trackHtml(entry, intervals, startMs, spanMs, showStateLabels) {
+  _trackHtml(entry, intervals, startMs, spanMs, showStateLabels, nowPercent, trackWidthPx, segmentLabelMetrics) {
     return this._isNumericEntry(entry)
-      ? this._numericTrackHtml(entry, intervals, startMs, spanMs, showStateLabels)
-      : this._discreteTrackHtml(entry, intervals, startMs, spanMs, showStateLabels);
+      ? this._numericTrackHtml(entry, intervals, startMs, spanMs, showStateLabels, nowPercent, trackWidthPx, segmentLabelMetrics)
+      : this._discreteTrackHtml(entry, intervals, startMs, spanMs, showStateLabels, nowPercent, trackWidthPx, segmentLabelMetrics);
   }
 
-  _discreteTrackHtml(entry, intervals, startMs, spanMs, showStateLabels) {
+  _discreteTrackHtml(entry, intervals, startMs, spanMs, showStateLabels, nowPercent, trackWidthPx, segmentLabelMetrics) {
+    const futureOverlay = nowPercent !== null && nowPercent < 100
+      ? `<div class="future-overlay" style="left:${nowPercent}%"></div>`
+      : "";
     return `<div class="track" style="--track-background:${this._escapeAttr(this._trackBackground(entry))}">
       ${intervals
         .map((interval) => {
@@ -1459,6 +1835,9 @@ class StateHistoryCard extends HTMLElement {
           const textColor = this._textColorForBackground(color);
           const label = this._labelForState(entry, interval.state);
           const rawLabel = this._rawLabelForInterval(entry, interval);
+          const labelHtml = showStateLabels
+            ? this._discreteSegmentLabelHtml(label, width, trackWidthPx, segmentLabelMetrics)
+            : "";
           return `<div
             class="segment"
             tabindex="0"
@@ -1475,14 +1854,18 @@ class StateHistoryCard extends HTMLElement {
             style="left:${left}%;width:${width}%;--segment-color:${this._escapeAttr(
               color
             )};--segment-text-color:${this._escapeAttr(textColor.color)};--segment-text-shadow:${this._escapeAttr(textColor.shadow)}">
-            ${showStateLabels ? `<span class="segment-label" data-hidden="true">${this._escape(label)}</span>` : ""}
+            ${labelHtml}
           </div>`;
         })
         .join("")}
+      ${futureOverlay}
     </div>`;
   }
 
-  _numericTrackHtml(entry, intervals, startMs, spanMs, showStateLabels) {
+  _numericTrackHtml(entry, intervals, startMs, spanMs, showStateLabels, nowPercent, trackWidthPx, segmentLabelMetrics) {
+    const futureOverlay = nowPercent !== null && nowPercent < 100
+      ? `<div class="future-overlay" style="left:${nowPercent}%"></div>`
+      : "";
     const background = this._numericGradient(entry, intervals, startMs, spanMs);
     return `<div
       class="track"
@@ -1492,8 +1875,20 @@ class StateHistoryCard extends HTMLElement {
       data-end-ms="${startMs + spanMs}"
       style="--track-background:${this._escapeAttr(this._trackBackground(entry))};background:${this._escapeAttr(background)}"
     >
-      ${showStateLabels ? this._numericLabelsHtml(entry, intervals, startMs, spanMs) : ""}
+      ${showStateLabels ? this._numericLabelsHtml(entry, intervals, startMs, spanMs, trackWidthPx, segmentLabelMetrics) : ""}
+      ${futureOverlay}
     </div>`;
+  }
+
+  _discreteSegmentLabelHtml(label, widthPercent, trackWidthPx, segmentLabelMetrics) {
+    const availableWidth = (trackWidthPx * widthPercent) / 100;
+    const requiredWidth = Math.ceil(this._measureTextWidth(
+      label,
+      segmentLabelMetrics.fontSize,
+      segmentLabelMetrics.fontWeight
+    )) + 14;
+    if (availableWidth < requiredWidth) return "";
+    return `<span class="segment-label">${this._escape(label)}</span>`;
   }
 
   _numericGradient(entry, intervals, startMs, spanMs) {
@@ -1509,15 +1904,17 @@ class StateHistoryCard extends HTMLElement {
     return `repeating-linear-gradient(90deg, transparent 0, transparent calc(25% - 1px), var(--divider-color) calc(25% - 1px), var(--divider-color) 25%), linear-gradient(90deg, ${stops.join(", ")}), var(--track-background)`;
   }
 
-  _numericLabelsHtml(entry, intervals, startMs, spanMs) {
-    const widthPx = this._axisWidth || 320;
+  _numericLabelsHtml(entry, intervals, startMs, spanMs, trackWidthPx, segmentLabelMetrics) {
     return intervals
       .map((interval) => {
         const left = ((interval.start - startMs) / spanMs) * 100;
         const width = ((interval.end - interval.start) / spanMs) * 100;
         const label = this._labelForState(entry, interval.state);
-        const availableWidth = (widthPx * width) / 100;
-        if (availableWidth < Math.ceil(this._measureTextWidth(label, 11, 500)) + 4) return "";
+        const availableWidth = (trackWidthPx * width) / 100;
+        if (
+          availableWidth <
+          Math.ceil(this._measureTextWidth(label, segmentLabelMetrics.fontSize, segmentLabelMetrics.fontWeight)) + 14
+        ) return "";
 
         const color = this._colorForState(entry, interval.state, interval.attributes);
         const textColor = this._textColorForBackground(color);
@@ -1529,6 +1926,31 @@ class StateHistoryCard extends HTMLElement {
         >${this._escape(label)}</span>`;
       })
       .join("");
+  }
+
+  _segmentLabelMetrics() {
+    const card = this.shadowRoot?.querySelector("#shc-content > ha-card");
+    const styles = card ? getComputedStyle(card) : undefined;
+    const fontSize = Number.parseFloat(
+      styles?.getPropertyValue("--shc-segment-font-size") ||
+      styles?.getPropertyValue("--state-history-segment-font-size") ||
+      ""
+    ) || 11;
+    const fontWeight = this._fontWeightNumber(
+      styles?.getPropertyValue("--shc-segment-font-weight") ||
+      styles?.getPropertyValue("--state-history-segment-font-weight") ||
+      ""
+    );
+    return { fontSize, fontWeight };
+  }
+
+  _fontWeightNumber(value, fallback = 500) {
+    const text = String(value || "").trim().toLowerCase();
+    const numeric = Number.parseFloat(text);
+    if (Number.isFinite(numeric)) return numeric;
+    if (text === "normal") return 400;
+    if (text === "bold") return 700;
+    return fallback;
   }
 
   _legendPosition() {
@@ -1871,10 +2293,15 @@ class StateHistoryCard extends HTMLElement {
 
   _scheduleLabelSync() {
     if (this._labelFrame) cancelAnimationFrame(this._labelFrame);
+    if (this._labelSettleTimer) clearTimeout(this._labelSettleTimer);
     this._labelFrame = requestAnimationFrame(() => {
       this._labelFrame = undefined;
-      this._syncSegmentLabels();
       this._syncLabelActionColors();
+      this._labelSettleTimer = setTimeout(() => {
+        this._labelSettleTimer = undefined;
+        if (!this.isConnected || !this.shadowRoot) return;
+        this._syncLabelActionColors();
+      }, 160);
     });
   }
 
@@ -1894,16 +2321,6 @@ class StateHistoryCard extends HTMLElement {
       button.style.setProperty("--label-action-color", color);
     }
   }
-
-  _syncSegmentLabels() {
-    const labels = this.shadowRoot.querySelectorAll(".segment-label");
-    for (const label of labels) {
-      const segment = label.closest(".segment");
-      const availableWidth = Math.max(0, segment.clientWidth - 8);
-      label.dataset.hidden = label.scrollWidth > availableWidth ? "true" : "false";
-    }
-  }
-
   _handleClick(event) {
     const target = event.target.closest?.(".name[data-more-info]");
     if (!target) return;

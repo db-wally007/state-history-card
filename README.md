@@ -143,6 +143,112 @@ entities:
 
 The card also accepts `colors` as an alias for `state_colors`, `labels` as an alias for `state_labels`, and `factor` as an alias for `scale`. Set `labels: "off"` to hide inline state labels.
 
+## Energy Date Picker Integration (YAML only)
+
+> **Note:** These options are only available through the YAML editor. The visual editor does not support them.
+
+Instead of a fixed `hours_to_show` window, the card can sync its time range with the built-in Home Assistant `energy-date-selection` card. This lets you use the same date picker used by the Energy dashboard and cards like `energy-custom-graph-card`.
+
+### Options
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| `use_energy_date_picker` | boolean | `false` | When `true`, the card ignores `hours_to_show` and gets its time range from an `energy-date-selection` card on the same dashboard view. |
+| `collection_key` | string | none | Links the card to a specific `energy-date-selection` picker. Use this when you have multiple date pickers on one dashboard. Must match the `collection_key` on the corresponding `energy-date-selection` card. |
+| `allow_compare` | boolean | `true` | When the energy date picker's compare toggle is active, a reduced-height compare row appears below each entity showing the comparison period. Set to `false` to disable. |
+
+### Example
+
+Place an `energy-date-selection` card and state-history-card together using the same `collection_key`:
+
+```yaml
+type: vertical-stack
+cards:
+  - type: energy-date-selection
+    collection_key: state_history_demo
+  - type: custom:state-history-card
+    title: Presence History
+    use_energy_date_picker: true
+    collection_key: state_history_demo
+    legend: on
+    timestamps: on
+    state_colors:
+      "on|Home": "#22c55e"
+      "off|Away": "#64748b"
+    entities:
+      - entity: binary_sensor.kitchen_presence
+        name: Kitchen
+      - entity: binary_sensor.office_presence
+        name: Office
+```
+
+### How it works
+
+- The `energy-date-selection` card creates a data collection on the HA frontend connection object.
+- This card subscribes to that collection and updates its time range whenever the date picker selection changes.
+- If the date picker is not yet loaded, the card retries for up to 10 seconds before giving up.
+- `refresh_interval` continues to work in energy picker mode — useful for live updates when viewing "today".
+- Compare mode adds a smaller row below each entity showing the comparison period side by side with the main period.
+
+## CSS Custom Properties (card_mod)
+
+All visual dimensions, colors, and font sizes are exposed as CSS custom properties. You can override them using `card_mod` or any other method that sets CSS variables on the card element.
+
+| Property | Default | Description |
+| --- | --- | --- |
+| `--state-history-card-padding` | `16px` | Inner padding of the card content area |
+| `--state-history-card-background` | theme card bg | Card background color |
+| `--state-history-card-border-radius` | theme radius / `12px` | Card border radius |
+| `--state-history-title-font-size` | `24px` | Title font size (overridden by `title_size` option) |
+| `--state-history-title-font-weight` | `normal` | Title font weight |
+| `--state-history-title-color` | theme primary text | Title text color |
+| `--state-history-title-padding` | `16px 16px 0` | Padding around the title |
+| `--state-history-label-font-size` | `13px` | Entity name label font size |
+| `--state-history-label-font-weight` | `normal` | Entity name label font weight |
+| `--state-history-label-color` | theme primary text | Entity name label color |
+| `--state-history-label-line-height` | `18px` | Entity name label line height |
+| `--state-history-row-height` | `18px` | Height of each timeline track |
+| `--state-history-row-gap` | `10px` | Vertical gap between entity rows |
+| `--state-history-track-border-radius` | `4px` | Border radius of timeline tracks |
+| `--state-history-track-background` | theme secondary bg | Track background (behind segments) |
+| `--state-history-track-grid-color` | theme divider | Color of the 25% grid lines |
+| `--state-history-future-color` | `rgba(0,0,0,0.15)` | Overlay color for the future (after "now") portion of today's track. Set to `transparent` to disable |
+| `--state-history-segment-font-size` | `11px` | Font size of labels inside timeline segments |
+| `--state-history-segment-font-weight` | `500` | Font weight of segment labels |
+| `--state-history-compare-row-height` | `row-height × 0.6` | Height of compare period tracks |
+| `--state-history-compare-row-opacity` | `0.5` | Opacity of compare period rows |
+| `--state-history-compare-row-margin-top` | `-6px` | Gap between main and compare rows |
+| `--state-history-compare-label-font-size` | `10px` | Font size of the compare period label |
+| `--state-history-axis-font-size` | `11px` | Font size of time axis labels |
+| `--state-history-axis-color` | theme secondary text | Time axis text color |
+| `--state-history-axis-tick-color` | theme divider | Color of axis tick marks |
+| `--state-history-legend-font-size` | `12px` | Font size of legend items |
+| `--state-history-legend-color` | theme secondary text | Legend text color |
+| `--state-history-legend-gap` | `8px 14px` | Gap between legend items (row column) |
+| `--state-history-legend-margin-top` | `14px` | Space above the legend |
+| `--state-history-swatch-size` | `10px` | Size of legend color swatches |
+| `--state-history-tooltip-font-size` | `12px` | Tooltip font size |
+| `--state-history-tooltip-border-radius` | `6px` | Tooltip border radius |
+| `--state-history-tooltip-padding` | `8px 10px` | Tooltip inner padding |
+
+### card_mod example
+
+```yaml
+type: custom:state-history-card
+card_mod:
+  style: |
+    ha-card {
+      --state-history-row-height: 24px;
+      --state-history-row-gap: 14px;
+      --state-history-label-font-size: 14px;
+      --state-history-legend-font-size: 13px;
+      --state-history-track-border-radius: 6px;
+      --state-history-compare-row-opacity: 0.4;
+    }
+entities:
+  - entity: binary_sensor.kitchen_presence
+```
+
 ## State Matching
 
 Home Assistant history stores raw values such as `on`, `off`, `home`, and `not_home`, while the frontend often displays translated labels such as `Home` and `Away`.
