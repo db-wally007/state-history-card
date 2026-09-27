@@ -120,6 +120,8 @@ entities:
 | `timestamps` | string | `on` | Timeline labels: `on` or `off`. Midnight marks show a weekday or date instead of `12:00 AM`. |
 | `state_colors` | object | `{}` | Global state-to-color map. Keys may match raw state, display label, or `|` separated aliases. |
 | `state_labels` | object | `{}` | Global raw-state/display-state-to-label map. Keys may use `|` aliases. |
+| `default_color` | string | none | One color for every state **not** named in `state_colors`. Replaces both the built-in `on`/`off`/`home` colors and the hashed per-state fallback, so rows with many distinct values (a temperature, a dimmer level) render as a single color instead of a rainbow. Explicit `state_colors` still win. |
+| `entities[].default_color` | string | global | Per-entity override for `default_color`. |
 | `color_source` | string | `state` | Global color source for clickable label underlines. Use `light` to use live light attributes when available. |
 | `color_stops` | object | none | Global numeric value-to-color stops. Entity-level `color_stops` override this. |
 | `null_color` | string | theme background | Color for numeric rows when a value is missing, invalid, or the row has no data. |

@@ -51,6 +51,9 @@ class StateHistoryCard extends HTMLElement {
     this._energyRetryTimer = undefined;
     this._energyRetryCount = 0;
     this._compareHistory = new Map();
+    this._fetchRetryCount = 0;
+    this._fetchRetryTimer = undefined;
+    this._retrying = false;
     // --- End energy date picker state ---
     this._handleDocumentPointerDown = (event) => {
       if (!event.composedPath().includes(this)) this._hideTooltip();
@@ -77,6 +80,7 @@ class StateHistoryCard extends HTMLElement {
     this._clearLabelPress();
     if (this._labelFrame) cancelAnimationFrame(this._labelFrame);
     if (this._labelSettleTimer) clearTimeout(this._labelSettleTimer);
+    if (this._fetchRetryTimer) clearTimeout(this._fetchRetryTimer);
     this._unsubscribeEnergyCollection();
   }
 
@@ -97,6 +101,7 @@ class StateHistoryCard extends HTMLElement {
       recorder: true,
       state_colors: {},
       state_labels: {},
+      default_color: undefined,
       ...config,
     };
     const historyConfigSignature = this._historyConfigSignature(this._config);
@@ -108,6 +113,9 @@ class StateHistoryCard extends HTMLElement {
       this._rangeEndMs = undefined;
     }
     this._lastStateSignature = "";
+    this._fetchRetryCount = 0;
+    this._retrying = false;
+    if (this._fetchRetryTimer) { clearTimeout(this._fetchRetryTimer); this._fetchRetryTimer = undefined; }
     // If switching to/from energy picker mode, reset subscription
     if (this._config.use_energy_date_picker) {
       this._unsubscribeEnergyCollection();
@@ -403,6 +411,8 @@ class StateHistoryCard extends HTMLElement {
       this._historyFetchSignature = signature;
       this._loadedEndMs = endMs;
       this._lastStateSignature = this._stateSignature();
+      this._fetchRetryCount = 0;
+      this._retrying = false;
 
       // --- Compare mode: fetch compare period history ---
       if (this._config.use_energy_date_picker && this._config.allow_compare !== false
@@ -442,7 +452,23 @@ class StateHistoryCard extends HTMLElement {
       }
       // --- End compare mode ---
     } catch (err) {
-      this._error = err?.message || String(err);
+      this._fetchRetryCount += 1;
+      if (this._fetchRetryCount <= 3) {
+        this._retrying = true;
+        this._fetchRetryTimer = setTimeout(() => {
+          this._fetchRetryTimer = undefined;
+          if (this._hass && this._config && !this._loading) {
+            this._fetchHistory();
+          } else {
+            this._retrying = false;
+            this._render();
+          }
+        }, 5_000);
+      } else {
+        console.warn("[state-history-card] fetch failed after retries:", err?.message || err);
+        this._fetchRetryCount = 0;
+        this._retrying = false;
+      }
     } finally {
       this._loading = false;
       this._render();
@@ -686,12 +712,20 @@ class StateHistoryCard extends HTMLElement {
     const globalColors = this._config.state_colors || this._config.colors || {};
     const candidates = this._stateLookupCandidates(entry, state);
     const stateKey = String(state).toLowerCase();
-    const color =
+    const explicit =
       this._lookupMappedValue(entityColors, candidates) ||
-      this._lookupMappedValue(globalColors, candidates) ||
-      DEFAULT_STATE_COLORS[stateKey];
+      this._lookupMappedValue(globalColors, candidates);
+    if (explicit) return explicit;
 
-    return color || this._fallbackColor(state);
+    /* default_color means "one colour for every state I did NOT name". It
+       therefore replaces both the built-in on/off/home table and the hashed
+       fallback — otherwise a row with many distinct states (a temperature, a
+       dimmer level) paints as a rainbow, which is exactly what a caller asking
+       for a default is trying to avoid. Explicit state_colors still win. */
+    const fallback = entry.default_color || this._config.default_color;
+    if (fallback) return fallback;
+
+    return DEFAULT_STATE_COLORS[stateKey] || this._fallbackColor(state);
   }
 
   _colorSource(entry) {
@@ -1720,7 +1754,7 @@ class StateHistoryCard extends HTMLElement {
             : ""
         }
         ${
-          this._loading || this._error
+          this._loading || this._error || this._retrying
             ? `<div class="status ${this._error ? "error" : ""}">${
                 this._error ? this._escape(this._error) : "Loading history..."
               }</div>`
@@ -3236,8 +3270,12 @@ const BASIC_COLOR_NAMES = {
   yellow: [255, 255, 0],
 };
 
-customElements.define("state-history-card-editor", StateHistoryCardEditor);
-customElements.define("state-history-card", StateHistoryCard);
+if (!customElements.get("state-history-card-editor")) {
+  customElements.define("state-history-card-editor", StateHistoryCardEditor);
+}
+if (!customElements.get("state-history-card")) {
+  customElements.define("state-history-card", StateHistoryCard);
+}
 
 window.customCards = window.customCards || [];
 window.customCards.push({

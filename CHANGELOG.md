@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.6
+
+- Adds Home Assistant energy date picker support: `use_energy_date_picker` drives the timeline window from the dashboard's energy period picker, with an optional compare period (`allow_compare`).
+- Adds card-mod CSS variables for layout, typography and future-range styling.
+- Adds `default_color` (global and per entity): one color for every state not named in `state_colors`. It replaces both the built-in `on`/`off`/`home` colors and the hashed per-state fallback, so a row with many distinct values renders as one color instead of a rainbow. Explicit `state_colors` still win.
+- Retries a failed history fetch up to 3 times, 5 seconds apart, showing "Loading history..." meanwhile instead of an error; gives up with a console warning.
+- Registers the card and its editor only if not already defined, so loading the module twice no longer throws.
+
 ## 0.1.5
 
 - Adds recorder statistics support for eligible bucketed numeric rows.
